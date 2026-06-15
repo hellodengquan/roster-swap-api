@@ -18,6 +18,30 @@ type SwapNotifMetadata struct {
 	Remark          string `json:"remark,omitempty"`
 }
 
+func GetUserPreference(userID uint) *models.UserPreference {
+	var pref models.UserPreference
+	err := config.DB.Where("user_id = ?", userID).First(&pref).Error
+	if err != nil {
+		pref = models.UserPreference{
+			UserID:                   userID,
+			InAppNotifyEnabled:       true,
+			EmailNotifyEnabled:       true,
+			IMNotifyEnabled:          true,
+			SwapRequestNotifyEnabled: true,
+			ApprovalNotifyEnabled:    true,
+		}
+		pref.SetNotifyChannels([]models.NotificationChannel{
+			models.ChannelInApp, models.ChannelEmail, models.ChannelIM,
+		})
+		config.DB.Create(&pref)
+	}
+	return &pref
+}
+
+func SaveUserPreference(pref *models.UserPreference) error {
+	return config.DB.Save(pref).Error
+}
+
 func CreateInAppNotification(userID uint, notifType models.NotificationType, title, content string, swapID *uint, metadata interface{}) error {
 	metaJSON := ""
 	if metadata != nil {
@@ -85,6 +109,10 @@ func DispatchIMNotification(userID uint, notifType models.NotificationType, titl
 		return fmt.Errorf("用户不存在: %v", err)
 	}
 
+	if user.Phone == "" {
+		return fmt.Errorf("用户 %s 未设置手机号", user.Username)
+	}
+
 	fmt.Printf("[即时消息通知] To: %s (手机号: %s)\n", user.Name, user.Phone)
 	fmt.Printf("  标题: %s\n", title)
 	fmt.Printf("  内容: %s\n", content)
@@ -104,20 +132,78 @@ func DispatchIMNotification(userID uint, notifType models.NotificationType, titl
 	return config.DB.Create(notif).Error
 }
 
-func NotifyUser(userID uint, notifType models.NotificationType, title, content string, swapID *uint, metadata interface{}) {
-	CreateInAppNotification(userID, notifType, title, content, swapID, metadata)
+func GetEnabledChannels(pref *models.UserPreference,
+	notifType models.NotificationType,
+	forcedChannels ...models.NotificationChannel) []models.NotificationChannel {
 
-	var user models.User
-	if err := config.DB.First(&user, userID).Error; err != nil {
-		return
+	if len(forcedChannels) > 0 {
+		return forcedChannels
 	}
 
-	if user.Email != "" {
-		DispatchEmailNotification(userID, notifType, title, content, swapID)
+	prefChannels := pref.GetNotifyChannels()
+
+	isSwapRelated := notifType == models.NotifTypeSwapCreated ||
+		notifType == models.NotifTypeSwapAccepted ||
+		notifType == models.NotifTypeSwapRejected ||
+		notifType == models.NotifTypeSwapCanceled
+
+	isApprovalRelated := notifType == models.NotifTypeSwapApproved ||
+		notifType == models.NotifTypeSwapDisapproved ||
+		notifType == models.NotifTypeSwapCompleted
+
+	enabled := false
+	switch {
+	case isSwapRelated:
+		enabled = pref.SwapRequestNotifyEnabled
+	case isApprovalRelated:
+		enabled = pref.ApprovalNotifyEnabled
+	default:
+		enabled = true
 	}
 
-	if user.Phone != "" {
-		DispatchIMNotification(userID, notifType, title, content, swapID)
+	if !enabled {
+		return []models.NotificationChannel{}
+	}
+
+	result := make([]models.NotificationChannel, 0, len(prefChannels))
+	for _, ch := range prefChannels {
+		switch ch {
+		case models.ChannelInApp:
+			if pref.InAppNotifyEnabled {
+				result = append(result, ch)
+			}
+		case models.ChannelEmail:
+			if pref.EmailNotifyEnabled {
+				result = append(result, ch)
+			}
+		case models.ChannelIM:
+			if pref.IMNotifyEnabled {
+				result = append(result, ch)
+			}
+		}
+	}
+
+	if len(result) == 0 {
+		result = []models.NotificationChannel{models.ChannelInApp}
+	}
+
+	return result
+}
+
+func NotifyUser(userID uint, notifType models.NotificationType, title, content string, swapID *uint, metadata interface{}, channels ...models.NotificationChannel) {
+
+	pref := GetUserPreference(userID)
+	enabledChannels := GetEnabledChannels(pref, notifType, channels...)
+
+	for _, ch := range enabledChannels {
+		switch ch {
+		case models.ChannelInApp:
+			CreateInAppNotification(userID, notifType, title, content, swapID, metadata)
+		case models.ChannelEmail:
+			DispatchEmailNotification(userID, notifType, title, content, swapID)
+		case models.ChannelIM:
+			DispatchIMNotification(userID, notifType, title, content, swapID)
+		}
 	}
 }
 

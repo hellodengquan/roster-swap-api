@@ -40,6 +40,8 @@ func SetupRoutes(r *gin.Engine) {
 			swaps.POST("/:id/approve", middleware.ManagerOrAdmin(), controllers.ApproveSwapRequest)
 			swaps.POST("/:id/disapprove", middleware.ManagerOrAdmin(), controllers.DisapproveSwapRequest)
 			swaps.POST("/:id/cancel", controllers.CancelSwapRequest)
+			swaps.POST("/batch/approve", middleware.ManagerOrAdmin(), controllers.BatchApproveSwap)
+			swaps.POST("/batch/disapprove", middleware.ManagerOrAdmin(), controllers.BatchDisapproveSwap)
 		}
 
 		logs := api.Group("/logs")
@@ -47,6 +49,7 @@ func SetupRoutes(r *gin.Engine) {
 		{
 			logs.GET("/my", controllers.GetMyOperationLogs)
 			logs.GET("", middleware.ManagerOrAdmin(), controllers.GetOperationLogs)
+			logs.GET("/export", middleware.ManagerOrAdmin(), controllers.ExportOperationLogs)
 		}
 
 		notifs := api.Group("/notifications")
@@ -56,6 +59,14 @@ func SetupRoutes(r *gin.Engine) {
 			notifs.GET("/:id", controllers.GetNotification)
 			notifs.POST("/:id/read", controllers.MarkNotificationRead)
 			notifs.POST("/read-all", controllers.MarkAllNotificationsRead)
+			notifs.POST("/dispatch", middleware.ManagerOrAdmin(), controllers.DispatchNotification)
+		}
+
+		prefs := api.Group("/preferences")
+		prefs.Use(middleware.AuthMiddleware())
+		{
+			prefs.GET("", controllers.GetMyPreferences)
+			prefs.PUT("", controllers.UpdatePreferences)
 		}
 	}
 }

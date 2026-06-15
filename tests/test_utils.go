@@ -45,6 +45,7 @@ func SetupTestEnv(t *testing.T) *TestContext {
 
 	err = db.AutoMigrate(
 		&models.User{},
+		&models.UserPreference{},
 		&models.Shift{},
 		&models.SwapRequest{},
 		&models.OperationLog{},
