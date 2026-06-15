@@ -93,15 +93,25 @@ func SeedData(db *gorm.DB) error {
 
 		for userIdx := 2; userIdx <= 4; userIdx++ {
 			slotIdx := (i + userIdx) % 3
+			timezone := "Asia/Shanghai"
+			if userIdx == 4 {
+				timezone = "America/New_York"
+			}
 			shift := models.Shift{
 				UserID:    uint(userIdx + 1),
 				ShiftDate: shiftDate,
 				StartTime: timeSlots[slotIdx].start,
 				EndTime:   timeSlots[slotIdx].end,
+				Timezone:  timezone,
 				ShiftType: shiftTypes[slotIdx],
 				Status:    models.ShiftStatusActive,
 				Location:  "总部办公区",
 				Note:      fmt.Sprintf("周%s排班", []string{"一", "二", "三", "四", "五"}[int(shiftDate.Weekday())-1]),
+			}
+			startUTC, endUTC, err := utils.ComputeShiftUTCTimes(shiftDate, shift.StartTime, shift.EndTime, timezone)
+			if err == nil {
+				shift.StartTimeUTC = startUTC
+				shift.EndTimeUTC = endUTC
 			}
 			if err := db.Create(&shift).Error; err != nil {
 				return fmt.Errorf("创建班次失败: %v", err)
