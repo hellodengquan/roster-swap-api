@@ -48,5 +48,14 @@ func SetupRoutes(r *gin.Engine) {
 			logs.GET("/my", controllers.GetMyOperationLogs)
 			logs.GET("", middleware.ManagerOrAdmin(), controllers.GetOperationLogs)
 		}
+
+		notifs := api.Group("/notifications")
+		notifs.Use(middleware.AuthMiddleware())
+		{
+			notifs.GET("", controllers.GetMyNotifications)
+			notifs.GET("/:id", controllers.GetNotification)
+			notifs.POST("/:id/read", controllers.MarkNotificationRead)
+			notifs.POST("/read-all", controllers.MarkAllNotificationsRead)
+		}
 	}
 }

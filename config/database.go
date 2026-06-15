@@ -23,6 +23,7 @@ func InitDB() (*gorm.DB, error) {
 		&models.Shift{},
 		&models.SwapRequest{},
 		&models.OperationLog{},
+		&models.Notification{},
 	)
 	if err != nil {
 		return nil, err
