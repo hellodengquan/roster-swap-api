@@ -21,6 +21,7 @@ func InitDB() (*gorm.DB, error) {
 	err = db.AutoMigrate(
 		&models.User{},
 		&models.UserPreference{},
+		&models.ApproverDelegate{},
 		&models.Shift{},
 		&models.SwapRequest{},
 		&models.OperationLog{},

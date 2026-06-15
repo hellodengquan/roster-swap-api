@@ -46,6 +46,7 @@ func SetupTestEnv(t *testing.T) *TestContext {
 	err = db.AutoMigrate(
 		&models.User{},
 		&models.UserPreference{},
+		&models.ApproverDelegate{},
 		&models.Shift{},
 		&models.SwapRequest{},
 		&models.OperationLog{},
@@ -105,6 +106,12 @@ func SetupTestEnv(t *testing.T) *TestContext {
 	for i := 0; i < 5; i++ {
 		date := today.AddDate(0, 0, i)
 		hour := 8 + (i * 4) % 16
+		timezone := "Asia/Shanghai"
+		if i%2 == 0 {
+			timezone = "Asia/Shanghai"
+		} else {
+			timezone = "America/New_York"
+		}
 
 		s1 := &models.Shift{
 			UserID:    userIDs["emp1"],
@@ -113,7 +120,11 @@ func SetupTestEnv(t *testing.T) *TestContext {
 			EndTime:   fmt.Sprintf("%02d:00", hour+8),
 			ShiftType: "早班", Status: models.ShiftStatusActive,
 			Location: "总部",
+			Timezone: timezone,
 		}
+		startUTC, endUTC, _ := utils.ComputeShiftUTCTimes(date, s1.StartTime, s1.EndTime, timezone)
+		s1.StartTimeUTC = startUTC
+		s1.EndTimeUTC = endUTC
 		db.Create(s1)
 		shiftIDs["emp1"] = append(shiftIDs["emp1"], s1.ID)
 
@@ -124,7 +135,11 @@ func SetupTestEnv(t *testing.T) *TestContext {
 			EndTime:   fmt.Sprintf("%02d:00", (hour+12)%24),
 			ShiftType: "中班", Status: models.ShiftStatusActive,
 			Location: "总部",
+			Timezone: timezone,
 		}
+		startUTC2, endUTC2, _ := utils.ComputeShiftUTCTimes(date, s2.StartTime, s2.EndTime, timezone)
+		s2.StartTimeUTC = startUTC2
+		s2.EndTimeUTC = endUTC2
 		db.Create(s2)
 		shiftIDs["emp2"] = append(shiftIDs["emp2"], s2.ID)
 
@@ -135,7 +150,11 @@ func SetupTestEnv(t *testing.T) *TestContext {
 			EndTime:   fmt.Sprintf("%02d:00", (hour+16)%24),
 			ShiftType: "晚班", Status: models.ShiftStatusActive,
 			Location: "总部",
+			Timezone: timezone,
 		}
+		startUTC3, endUTC3, _ := utils.ComputeShiftUTCTimes(date, s3.StartTime, s3.EndTime, timezone)
+		s3.StartTimeUTC = startUTC3
+		s3.EndTimeUTC = endUTC3
 		db.Create(s3)
 		shiftIDs["emp3"] = append(shiftIDs["emp3"], s3.ID)
 	}

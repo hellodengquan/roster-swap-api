@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"roster-swap-api/utils"
 
 	"github.com/gin-gonic/gin"
+	"github.com/xuri/excelize/v2"
+	"gorm.io/gorm"
 )
 
 type BatchApproveRequest struct {
@@ -29,7 +32,7 @@ type BatchResult struct {
 	FailedCount  int    `json:"failed_count"`
 }
 
-func processSingleApproval(c *gin.Context, swapID uint, approver *models.User, remark string) error {
+func processSingleApproval(c *gin.Context, swapID uint, approver *models.User, remark string, delegateInfo *models.ApproverDelegate) error {
 	var swapReq models.SwapRequest
 	if err := config.DB.Preload("Requester").Preload("TargetUser").
 		Preload("RequesterShift").Preload("TargetShift").
@@ -69,48 +72,89 @@ func processSingleApproval(c *gin.Context, swapID uint, approver *models.User, r
 		return fmt.Errorf("ID %d: 被申请人时段冲突(ID:%d)", swapID, conflict.ID)
 	}
 
-	tx := config.DB.Begin()
-	now := time.Now()
+	txID := fmt.Sprintf("batch_approve_%d_%d", swapID, time.Now().UnixNano())
+	ctx := utils.NewCompensatingTransaction(config.DB, txID)
 
-	if err := tx.Model(&swapReq).Updates(map[string]interface{}{
-		"status":          models.SwapStatusApproved,
-		"approver_id":     &approver.ID,
-		"approval_remark": remark,
-		"approved_at":     &now,
-	}).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("ID %d: 更新申请状态失败: %v", swapID, err)
+	originalRequesterShiftUserID := swapReq.RequesterShift.UserID
+	originalTargetShiftUserID := swapReq.TargetShift.UserID
+	originalStatus := swapReq.Status
+	userID := approver.ID
+
+	ctx.AddStep("update_status_approved", "更新申请状态为审批中",
+		func(tx *gorm.DB) error {
+			now := time.Now()
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":          models.SwapStatusApproved,
+				"approver_id":     &userID,
+				"approval_remark": remark,
+				"approved_at":     &now,
+			}).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":          originalStatus,
+				"approver_id":     nil,
+				"approval_remark": "",
+				"approved_at":     nil,
+			}).Error
+		},
+	)
+
+	ctx.AddStep("update_requester_shift", "交换申请人班次所有权",
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.RequesterShift).Update("user_id", swapReq.TargetUserID).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.RequesterShift).Update("user_id", originalRequesterShiftUserID).Error
+		},
+	)
+
+	ctx.AddStep("update_target_shift", "交换目标班次所有权",
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.TargetShift).Update("user_id", swapReq.RequesterID).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.TargetShift).Update("user_id", originalTargetShiftUserID).Error
+		},
+	)
+
+	ctx.AddStep("update_status_completed", "标记换班为完成",
+		func(tx *gorm.DB) error {
+			now := time.Now()
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":       models.SwapStatusCompleted,
+				"completed_at": &now,
+			}).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":       models.SwapStatusApproved,
+				"completed_at": nil,
+			}).Error
+		},
+	)
+
+	err = ctx.Execute()
+	if err != nil {
+		if ctx.IsCompensated() {
+			return fmt.Errorf("ID %d: 审批失败已回滚: %v (tx:%s)", swapID, err, txID)
+		}
+		return fmt.Errorf("ID %d: 审批失败且补偿失败: %v (tx:%s)", swapID, err, txID)
 	}
-
-	if err := tx.Model(&swapReq.RequesterShift).
-		Update("user_id", swapReq.TargetUserID).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("ID %d: 交换申请人班次失败: %v", swapID, err)
-	}
-
-	if err := tx.Model(&swapReq.TargetShift).
-		Update("user_id", swapReq.RequesterID).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("ID %d: 交换目标班次失败: %v", swapID, err)
-	}
-
-	completeNow := time.Now()
-	if err := tx.Model(&swapReq).Updates(map[string]interface{}{
-		"status":       models.SwapStatusCompleted,
-		"completed_at": &completeNow,
-	}).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("ID %d: 标记完成失败: %v", swapID, err)
-	}
-
-	tx.Commit()
 
 	detail := fmt.Sprintf("[%s(%s)] 批量审批通过, 备注: %s", approver.Name, approver.Role, remark)
-	userID, _ := c.Get("user_id")
+	userIDVal, _ := c.Get("user_id")
+	actualUserID := userIDVal.(uint)
+	if delegateInfo != nil && actualUserID != approver.ID {
+		var actualOperator models.User
+		config.DB.First(&actualOperator, actualUserID)
+		detail = fmt.Sprintf("[%s(%s) 代 %s] 批量审批通过, 备注: %s",
+			actualOperator.Name, actualOperator.Role, approver.Name, remark)
+	}
 	ip := c.ClientIP()
 	ua := c.GetHeader("User-Agent")
 	log := &models.OperationLog{
-		UserID:        userID.(uint),
+		UserID:        actualUserID,
 		OperationType: models.OpTypeApproveSwap,
 		SwapRequestID: &swapReq.ID,
 		Detail:        detail,
@@ -121,7 +165,7 @@ func processSingleApproval(c *gin.Context, swapID uint, approver *models.User, r
 
 	detail2 := "批量审批换班完成"
 	log2 := &models.OperationLog{
-		UserID:        userID.(uint),
+		UserID:        actualUserID,
 		OperationType: models.OpTypeCompleteSwap,
 		SwapRequestID: &swapReq.ID,
 		Detail:        detail2,
@@ -151,7 +195,7 @@ func processSingleApproval(c *gin.Context, swapID uint, approver *models.User, r
 	return nil
 }
 
-func processSingleDisapproval(c *gin.Context, swapID uint, approver *models.User, remark string) error {
+func processSingleDisapproval(c *gin.Context, swapID uint, approver *models.User, remark string, delegateInfo *models.ApproverDelegate) error {
 	var swapReq models.SwapRequest
 	if err := config.DB.Preload("Requester").Preload("TargetUser").
 		Preload("RequesterShift").Preload("TargetShift").
@@ -175,10 +219,17 @@ func processSingleDisapproval(c *gin.Context, swapID uint, approver *models.User
 
 	detail := fmt.Sprintf("[%s(%s)] 批量审批驳回, 原因: %s", approver.Name, approver.Role, remark)
 	userID, _ := c.Get("user_id")
+	actualUserID := userID.(uint)
+	if delegateInfo != nil && actualUserID != approver.ID {
+		var actualOperator models.User
+		config.DB.First(&actualOperator, actualUserID)
+		detail = fmt.Sprintf("[%s(%s) 代 %s] 批量审批驳回, 原因: %s",
+			actualOperator.Name, actualOperator.Role, approver.Name, remark)
+	}
 	ip := c.ClientIP()
 	ua := c.GetHeader("User-Agent")
 	log := &models.OperationLog{
-		UserID:        userID.(uint),
+		UserID:        actualUserID,
 		OperationType: models.OpTypeDisapproveSwap,
 		SwapRequestID: &swapReq.ID,
 		Detail:        detail,
@@ -211,14 +262,15 @@ func processSingleDisapproval(c *gin.Context, swapID uint, approver *models.User
 func BatchApproveSwap(c *gin.Context) {
 	userID := middleware.GetCurrentUserID(c)
 
-	var approver models.User
-	if err := config.DB.First(&approver, userID).Error; err != nil {
-		utils.InternalServerError(c, "审批人信息获取失败")
+	effectiveApprover, delegate, err := CheckApprovalPermission(userID)
+	if err != nil {
+		utils.Forbidden(c, err.Error())
 		return
 	}
-	if approver.Role != models.RoleManager && approver.Role != models.RoleAdmin {
-		utils.Forbidden(c, fmt.Sprintf("当前角色(%s)无批量审批权限", approver.Role))
-		return
+	approver := effectiveApprover
+	var delegateInfo *models.ApproverDelegate
+	if delegate != nil {
+		delegateInfo = delegate
 	}
 
 	var req BatchApproveRequest
@@ -241,7 +293,7 @@ func BatchApproveSwap(c *gin.Context) {
 	}
 
 	for _, id := range req.IDs {
-		err := processSingleApproval(c, id, &approver, req.Remark)
+		err := processSingleApproval(c, id, approver, req.Remark, delegateInfo)
 		if err != nil {
 			result.FailedIDs = append(result.FailedIDs, id)
 			result.Errors = append(result.Errors, err.Error())
@@ -261,14 +313,15 @@ func BatchApproveSwap(c *gin.Context) {
 func BatchDisapproveSwap(c *gin.Context) {
 	userID := middleware.GetCurrentUserID(c)
 
-	var approver models.User
-	if err := config.DB.First(&approver, userID).Error; err != nil {
-		utils.InternalServerError(c, "审批人信息获取失败")
+	effectiveApprover, delegate, err := CheckApprovalPermission(userID)
+	if err != nil {
+		utils.Forbidden(c, err.Error())
 		return
 	}
-	if approver.Role != models.RoleManager && approver.Role != models.RoleAdmin {
-		utils.Forbidden(c, fmt.Sprintf("当前角色(%s)无批量审批权限", approver.Role))
-		return
+	approver := effectiveApprover
+	var delegateInfo *models.ApproverDelegate
+	if delegate != nil {
+		delegateInfo = delegate
 	}
 
 	var req BatchApproveRequest
@@ -295,7 +348,7 @@ func BatchDisapproveSwap(c *gin.Context) {
 	}
 
 	for _, id := range req.IDs {
-		err := processSingleDisapproval(c, id, &approver, req.Remark)
+		err := processSingleDisapproval(c, id, approver, req.Remark, delegateInfo)
 		if err != nil {
 			result.FailedIDs = append(result.FailedIDs, id)
 			result.Errors = append(result.Errors, err.Error())
@@ -328,7 +381,7 @@ func ExportOperationLogs(c *gin.Context) {
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
 	format := c.DefaultQuery("format", "csv")
-	if format != "csv" {
+	if format != "csv" && format != "json" && format != "excel" {
 		format = "csv"
 	}
 
@@ -362,64 +415,18 @@ func ExportOperationLogs(c *gin.Context) {
 	var user models.User
 	config.DB.First(&user, userID)
 
-	filename := fmt.Sprintf("operation_logs_%s_%s.csv",
-		user.Username,
-		time.Now().Format("20060102_150405"))
+	timestamp := time.Now().Format("20060102_150405")
 
-	c.Header("Content-Type", "text/csv; charset=utf-8")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
-	c.Writer.WriteString("\xEF\xBB\xBF")
-
-	writer := csv.NewWriter(c.Writer)
-	writer.Write([]string{
-		"记录ID",
-		"操作人ID",
-		"操作人姓名",
-		"操作人部门",
-		"操作类型",
-		"换班申请ID",
-		"班次ID",
-		"操作详情",
-		"IP地址",
-		"浏览器",
-		"操作时间",
-	})
-
-	for _, log := range logs {
-		opTypeCN := operationTypeCN(log.OperationType)
-		userName := ""
-		userDept := ""
-		if log.User.ID > 0 {
-			userName = log.User.Name
-			userDept = log.User.Department
-		}
-		swapStr := ""
-		if log.SwapRequestID != nil {
-			swapStr = strconv.FormatUint(uint64(*log.SwapRequestID), 10)
-		}
-		shiftStr := ""
-		if log.ShiftID != nil {
-			shiftStr = strconv.FormatUint(uint64(*log.ShiftID), 10)
-		}
-
-		writer.Write([]string{
-			strconv.FormatUint(uint64(log.ID), 10),
-			strconv.FormatUint(uint64(log.UserID), 10),
-			userName,
-			userDept,
-			opTypeCN,
-			swapStr,
-			shiftStr,
-			log.Detail,
-			log.IPAddress,
-			log.UserAgent,
-			log.CreatedAt.Format("2006-01-02 15:04:05"),
-		})
+	switch format {
+	case "json":
+		exportJSON(c, logs, user, timestamp)
+	case "excel":
+		exportExcel(c, logs, user, timestamp)
+	default:
+		exportCSV(c, logs, user, timestamp)
 	}
 
-	writer.Flush()
-
-	detail := fmt.Sprintf("[%s] 导出操作日志，共%d条记录", user.Name, len(logs))
+	detail := fmt.Sprintf("[%s] 导出操作日志，格式: %s，共%d条记录", user.Name, format, len(logs))
 	ip := c.ClientIP()
 	ua := c.GetHeader("User-Agent")
 	logEntry := &models.OperationLog{
@@ -430,8 +437,143 @@ func ExportOperationLogs(c *gin.Context) {
 		UserAgent:     ua,
 	}
 	config.DB.Create(logEntry)
+}
 
+func exportCSV(c *gin.Context, logs []models.OperationLog, user models.User, timestamp string) {
+	filename := fmt.Sprintf("operation_logs_%s_%s.csv", user.Username, timestamp)
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	c.Writer.WriteString("\xEF\xBB\xBF")
+
+	writer := csv.NewWriter(c.Writer)
+	writer.Write([]string{
+		"记录ID", "操作人ID", "操作人姓名", "操作人部门",
+		"操作类型", "换班申请ID", "班次ID", "操作详情",
+		"IP地址", "浏览器", "操作时间",
+	})
+
+	for _, log := range logs {
+		writer.Write(logToRow(&log))
+	}
+
+	writer.Flush()
 	c.Status(http.StatusOK)
+}
+
+func exportJSON(c *gin.Context, logs []models.OperationLog, user models.User, timestamp string) {
+	filename := fmt.Sprintf("operation_logs_%s_%s.json", user.Username, timestamp)
+
+	exportData := make([]map[string]interface{}, 0, len(logs))
+	for _, log := range logs {
+		row := logToRow(&log)
+		exportData = append(exportData, map[string]interface{}{
+			"id":          row[0],
+			"user_id":     row[1],
+			"user_name":   row[2],
+			"department":  row[3],
+			"op_type":     row[4],
+			"swap_id":     row[5],
+			"shift_id":    row[6],
+			"detail":      row[7],
+			"ip_address":  row[8],
+			"user_agent":  row[9],
+			"created_at":  row[10],
+		})
+	}
+
+	response := map[string]interface{}{
+		"export_time": time.Now().Format("2006-01-02 15:04:05"),
+		"exported_by": user.Name,
+		"total_count": len(logs),
+		"format":      "json",
+		"data":        exportData,
+	}
+
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+
+	jsonData, _ := json.MarshalIndent(response, "", "  ")
+	c.Writer.Write(jsonData)
+	c.Status(http.StatusOK)
+}
+
+func exportExcel(c *gin.Context, logs []models.OperationLog, user models.User, timestamp string) {
+	filename := fmt.Sprintf("operation_logs_%s_%s.xlsx", user.Username, timestamp)
+	f := excelize.NewFile()
+	sheetName := "操作日志"
+	index, _ := f.NewSheet(sheetName)
+
+	headers := []string{
+		"记录ID", "操作人ID", "操作人姓名", "操作人部门",
+		"操作类型", "换班申请ID", "班次ID", "操作详情",
+		"IP地址", "浏览器", "操作时间",
+	}
+	for colIdx, header := range headers {
+		cell := fmt.Sprintf("%s1", string(rune('A'+colIdx)))
+		f.SetCellValue(sheetName, cell, header)
+	}
+
+	style, _ := f.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"#E0E0E0"}, Pattern: 1},
+	})
+	f.SetRowStyle(sheetName, 1, 1, style)
+
+	for rowIdx, log := range logs {
+		row := logToRow(&log)
+		for colIdx, val := range row {
+			cell := fmt.Sprintf("%s%d", string(rune('A'+colIdx)), rowIdx+2)
+			f.SetCellValue(sheetName, cell, val)
+		}
+	}
+
+	for colIdx := range headers {
+		col := string(rune('A' + colIdx))
+		f.SetColWidth(sheetName, col, col, 18)
+	}
+
+	f.SetColWidth(sheetName, "H", "H", 50)
+	f.SetColWidth(sheetName, "J", "J", 40)
+
+	f.SetActiveSheet(index)
+	f.DeleteSheet("Sheet1")
+
+	c.Header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+
+	f.Write(c.Writer)
+	c.Status(http.StatusOK)
+}
+
+func logToRow(log *models.OperationLog) []string {
+	userName := ""
+	userDept := ""
+	if log.User.ID > 0 {
+		userName = log.User.Name
+		userDept = log.User.Department
+	}
+	swapStr := ""
+	if log.SwapRequestID != nil {
+		swapStr = strconv.FormatUint(uint64(*log.SwapRequestID), 10)
+	}
+	shiftStr := ""
+	if log.ShiftID != nil {
+		shiftStr = strconv.FormatUint(uint64(*log.ShiftID), 10)
+	}
+
+	return []string{
+		strconv.FormatUint(uint64(log.ID), 10),
+		strconv.FormatUint(uint64(log.UserID), 10),
+		userName,
+		userDept,
+		operationTypeCN(log.OperationType),
+		swapStr,
+		shiftStr,
+		log.Detail,
+		log.IPAddress,
+		log.UserAgent,
+		log.CreatedAt.Format("2006-01-02 15:04:05"),
+	}
 }
 
 func operationTypeCN(opType models.OperationType) string {

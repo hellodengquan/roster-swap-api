@@ -11,6 +11,7 @@ import (
 	"roster-swap-api/utils"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type CreateSwapReq struct {
@@ -71,6 +72,76 @@ func detectTimeSlotConflict(userID uint, shiftDate time.Time, startTime, endTime
 		return nil, nil
 	}
 	return &conflictSwap, nil
+}
+
+func detectUTCTimeConflict(userID uint, shift *models.Shift, excludeSwapIDs ...uint) (*models.SwapRequest, error) {
+	if shift.StartTimeUTC.IsZero() || shift.EndTimeUTC.IsZero() {
+		return nil, nil
+	}
+
+	var user models.User
+	if err := config.DB.First(&user, userID).Error; err != nil {
+		return nil, nil
+	}
+
+	activeStatuses := []string{
+		string(models.SwapStatusPending),
+		string(models.SwapStatusAccepted),
+	}
+
+	var activeSwaps []models.SwapRequest
+	err := config.DB.Where(`
+		(requester_id = ? OR target_user_id = ?) AND status IN ?`,
+		userID, userID, activeStatuses).
+		Preload("RequesterShift").
+		Preload("TargetShift").
+		Find(&activeSwaps).Error
+	if err != nil {
+		return nil, err
+	}
+
+	for _, swap := range activeSwaps {
+		skip := false
+		for _, excludeID := range excludeSwapIDs {
+			if swap.ID == excludeID {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
+		var existingShift models.Shift
+		if swap.RequesterID == userID {
+			existingShift = swap.RequesterShift
+		} else if swap.TargetUserID == userID {
+			existingShift = swap.TargetShift
+		} else {
+			continue
+		}
+
+		if existingShift.ID == 0 {
+			continue
+		}
+
+		minValidTime := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		if existingShift.StartTimeUTC.Before(minValidTime) || existingShift.EndTimeUTC.Before(minValidTime) {
+			continue
+		}
+		if existingShift.StartTimeUTC.IsZero() || existingShift.EndTimeUTC.IsZero() {
+			continue
+		}
+
+		overlapStart := shift.StartTimeUTC.Before(existingShift.EndTimeUTC) &&
+			existingShift.StartTimeUTC.Before(shift.EndTimeUTC)
+
+		if overlapStart {
+			return &swap, nil
+		}
+	}
+
+	return nil, nil
 }
 
 func CreateSwapRequest(c *gin.Context) {
@@ -154,6 +225,36 @@ func CreateSwapRequest(c *gin.Context) {
 		utils.BadRequest(c, fmt.Sprintf(
 			"被申请人在该时段存在冲突换班申请(ID:%d, 当前状态:%s)，请选择其他时段",
 			conflict.ID, conflict.Status,
+		))
+		return
+	}
+
+	utcConflict, err := detectUTCTimeConflict(userID, &requesterShift)
+	if err != nil {
+		utils.InternalServerError(c, "跨时区冲突检测失败")
+		return
+	}
+	if utcConflict != nil {
+		utils.BadRequest(c, fmt.Sprintf(
+			"检测到跨时区时间重叠冲突(申请ID:%d)：您的班次(%s UTC)与现有申请班次(%s UTC)存在重叠，请确认时间",
+			utcConflict.ID,
+			requesterShift.StartTimeUTC.Format("2006-01-02 15:04"),
+			utcConflict.RequesterShift.StartTimeUTC.Format("2006-01-02 15:04"),
+		))
+		return
+	}
+
+	utcConflict, err = detectUTCTimeConflict(req.TargetUserID, &targetShift)
+	if err != nil {
+		utils.InternalServerError(c, "跨时区冲突检测失败")
+		return
+	}
+	if utcConflict != nil {
+		utils.BadRequest(c, fmt.Sprintf(
+			"检测到被申请人跨时区时间重叠冲突(申请ID:%d)：目标班次(%s UTC)与现有申请班次(%s UTC)存在重叠",
+			utcConflict.ID,
+			targetShift.StartTimeUTC.Format("2006-01-02 15:04"),
+			utcConflict.RequesterShift.StartTimeUTC.Format("2006-01-02 15:04"),
 		))
 		return
 	}
@@ -423,14 +524,15 @@ func ApproveSwapRequest(c *gin.Context) {
 		return
 	}
 
-	var approver models.User
-	if err := config.DB.First(&approver, userID).Error; err != nil {
-		utils.InternalServerError(c, "审批人信息获取失败")
+	effectiveApprover, delegate, err := CheckApprovalPermission(userID)
+	if err != nil {
+		utils.Forbidden(c, err.Error())
 		return
 	}
-	if approver.Role != models.RoleManager && approver.Role != models.RoleAdmin {
-		utils.Forbidden(c, fmt.Sprintf("当前角色(%s)无审批权限，需要经理或管理员权限", approver.Role))
-		return
+	approver := effectiveApprover
+	var delegateInfo *models.ApproverDelegate
+	if delegate != nil {
+		delegateInfo = delegate
 	}
 
 	var swapReq models.SwapRequest
@@ -483,47 +585,91 @@ func ApproveSwapRequest(c *gin.Context) {
 		return
 	}
 
-	tx := config.DB.Begin()
+	txID := fmt.Sprintf("swap_approve_%d_%d", swapReq.ID, time.Now().UnixNano())
+	ctx := utils.NewCompensatingTransaction(config.DB, txID)
 
-	now := time.Now()
-	updates := map[string]interface{}{
-		"status":           models.SwapStatusApproved,
-		"approver_id":      &userID,
-		"approval_remark":  req.Remark,
-		"approved_at":      &now,
-	}
+	originalRequesterShiftUserID := swapReq.RequesterShift.UserID
+	originalTargetShiftUserID := swapReq.TargetShift.UserID
+	originalStatus := swapReq.Status
 
-	if err := tx.Model(&swapReq).Updates(updates).Error; err != nil {
-		tx.Rollback()
-		utils.InternalServerError(c, "审批失败: "+err.Error())
+	ctx.AddStep("update_status_approved", "更新申请状态为审批中",
+		func(tx *gorm.DB) error {
+			now := time.Now()
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":          models.SwapStatusApproved,
+				"approver_id":     &userID,
+				"approval_remark": req.Remark,
+				"approved_at":     &now,
+			}).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":          originalStatus,
+				"approver_id":     nil,
+				"approval_remark": "",
+				"approved_at":     nil,
+			}).Error
+		},
+	)
+
+	ctx.AddStep("update_requester_shift", "交换申请人班次所有权",
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.RequesterShift).Update("user_id", swapReq.TargetUserID).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.RequesterShift).Update("user_id", originalRequesterShiftUserID).Error
+		},
+	)
+
+	ctx.AddStep("update_target_shift", "交换目标班次所有权",
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.TargetShift).Update("user_id", swapReq.RequesterID).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq.TargetShift).Update("user_id", originalTargetShiftUserID).Error
+		},
+	)
+
+	ctx.AddStep("update_status_completed", "标记换班为完成",
+		func(tx *gorm.DB) error {
+			now := time.Now()
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":       models.SwapStatusCompleted,
+				"completed_at": &now,
+			}).Error
+		},
+		func(tx *gorm.DB) error {
+			return tx.Model(&swapReq).Updates(map[string]interface{}{
+				"status":       models.SwapStatusApproved,
+				"completed_at": nil,
+			}).Error
+		},
+	)
+
+	err = ctx.Execute()
+	if err != nil {
+		txSummary := ctx.GetSummary()
+		if ctx.IsCompensated() {
+			utils.SuccessWithMessage(c,
+				fmt.Sprintf("审批失败，已自动回滚: %v。事务ID: %s", err, txID),
+				gin.H{
+					"tx_summary": txSummary,
+					"compensated": true,
+				})
+			return
+		}
+		utils.InternalServerError(c, fmt.Sprintf(
+			"审批失败且补偿未完全成功: %v。事务ID: %s，请联系管理员核查数据", err, txID))
 		return
 	}
-
-	if err := tx.Model(&swapReq.RequesterShift).Update("user_id", swapReq.TargetUserID).Error; err != nil {
-		tx.Rollback()
-		utils.InternalServerError(c, "更新申请人班次失败")
-		return
-	}
-
-	if err := tx.Model(&swapReq.TargetShift).Update("user_id", swapReq.RequesterID).Error; err != nil {
-		tx.Rollback()
-		utils.InternalServerError(c, "更新目标班次失败")
-		return
-	}
-
-	completeNow := time.Now()
-	if err := tx.Model(&swapReq).Updates(map[string]interface{}{
-		"status":       models.SwapStatusCompleted,
-		"completed_at": &completeNow,
-	}).Error; err != nil {
-		tx.Rollback()
-		utils.InternalServerError(c, "更新完成状态失败")
-		return
-	}
-
-	tx.Commit()
 
 	detail := fmt.Sprintf("[%s(%s)] 审批通过换班申请，备注: %s", approver.Name, approver.Role, req.Remark)
+	if delegateInfo != nil {
+		var actualOperator models.User
+		config.DB.First(&actualOperator, userID)
+		detail = fmt.Sprintf("[%s(%s) 代 %s] 审批通过换班申请，备注: %s",
+			actualOperator.Name, actualOperator.Role, approver.Name, req.Remark)
+	}
 	middleware.LogOperation(c, models.OpTypeApproveSwap, &swapReq.ID, nil, detail)
 
 	detail2 := "换班完成，双方班次已交换"
@@ -574,14 +720,15 @@ func DisapproveSwapRequest(c *gin.Context) {
 		return
 	}
 
-	var approver models.User
-	if err := config.DB.First(&approver, userID).Error; err != nil {
-		utils.InternalServerError(c, "审批人信息获取失败")
+	effectiveApprover, delegate, err := CheckApprovalPermission(userID)
+	if err != nil {
+		utils.Forbidden(c, err.Error())
 		return
 	}
-	if approver.Role != models.RoleManager && approver.Role != models.RoleAdmin {
-		utils.Forbidden(c, fmt.Sprintf("当前角色(%s)无审批权限，需要经理或管理员权限", approver.Role))
-		return
+	approver := effectiveApprover
+	var delegateInfo *models.ApproverDelegate
+	if delegate != nil {
+		delegateInfo = delegate
 	}
 
 	var swapReq models.SwapRequest
@@ -600,7 +747,7 @@ func DisapproveSwapRequest(c *gin.Context) {
 	now := time.Now()
 	updates := map[string]interface{}{
 		"status":          models.SwapStatusDisapproved,
-		"approver_id":     &userID,
+		"approver_id":     &approver.ID,
 		"approval_remark": req.Remark,
 		"approved_at":     &now,
 	}
@@ -611,6 +758,12 @@ func DisapproveSwapRequest(c *gin.Context) {
 	}
 
 	detail := fmt.Sprintf("[%s(%s)] 驳回换班申请，原因: %s", approver.Name, approver.Role, req.Remark)
+	if delegateInfo != nil {
+		var actualOperator models.User
+		config.DB.First(&actualOperator, userID)
+		detail = fmt.Sprintf("[%s(%s) 代 %s] 驳回换班申请，原因: %s",
+			actualOperator.Name, actualOperator.Role, approver.Name, req.Remark)
+	}
 	middleware.LogOperation(c, models.OpTypeDisapproveSwap, &swapReq.ID, nil, detail)
 
 	reqShiftDesc := utils.BuildShiftDescription(&swapReq.RequesterShift)

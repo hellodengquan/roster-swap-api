@@ -20,6 +20,7 @@ type CreateShiftRequest struct {
 	ShiftType string `json:"shift_type"`
 	Location  string `json:"location"`
 	Note      string `json:"note"`
+	Timezone  string `json:"timezone"`
 }
 
 type UpdateShiftRequest struct {
@@ -51,15 +52,29 @@ func CreateShift(c *gin.Context) {
 		return
 	}
 
+	timezone := user.Timezone
+	if req.Timezone != "" {
+		timezone = req.Timezone
+	}
+
+	startUTC, endUTC, err := utils.ComputeShiftUTCTimes(shiftDate, req.StartTime, req.EndTime, timezone)
+	if err != nil {
+		utils.BadRequest(c, "时区时间转换失败: "+err.Error())
+		return
+	}
+
 	shift := &models.Shift{
-		UserID:    req.UserID,
-		ShiftDate: shiftDate,
-		StartTime: req.StartTime,
-		EndTime:   req.EndTime,
-		ShiftType: req.ShiftType,
-		Status:    models.ShiftStatusActive,
-		Location:  req.Location,
-		Note:      req.Note,
+		UserID:       req.UserID,
+		ShiftDate:    shiftDate,
+		StartTime:    req.StartTime,
+		EndTime:      req.EndTime,
+		StartTimeUTC: startUTC,
+		EndTimeUTC:   endUTC,
+		Timezone:     timezone,
+		ShiftType:    req.ShiftType,
+		Status:       models.ShiftStatusActive,
+		Location:     req.Location,
+		Note:         req.Note,
 	}
 
 	if err := config.DB.Create(shift).Error; err != nil {
@@ -140,19 +155,49 @@ func UpdateShift(c *gin.Context) {
 	}
 
 	updates := make(map[string]interface{})
+	needUTCUpdate := false
+	newShiftDate := shift.ShiftDate
+	newStartTime := shift.StartTime
+	newEndTime := shift.EndTime
+	newTimezone := shift.Timezone
+
 	if req.ShiftDate != "" {
-		shiftDate, err := time.Parse("2006-01-02", req.ShiftDate)
+		parsed, err := time.Parse("2006-01-02", req.ShiftDate)
 		if err != nil {
 			utils.BadRequest(c, "日期格式错误，请使用 YYYY-MM-DD")
 			return
 		}
-		updates["shift_date"] = shiftDate
+		newShiftDate = parsed
+		updates["shift_date"] = parsed
+		needUTCUpdate = true
 	}
 	if req.StartTime != "" {
+		newStartTime = req.StartTime
 		updates["start_time"] = req.StartTime
+		needUTCUpdate = true
 	}
 	if req.EndTime != "" {
+		newEndTime = req.EndTime
 		updates["end_time"] = req.EndTime
+		needUTCUpdate = true
+	}
+
+	if needUTCUpdate {
+		var user models.User
+		config.DB.First(&user, shift.UserID)
+		timezone := user.Timezone
+		if newTimezone == "" {
+			newTimezone = timezone
+		}
+
+		startUTC, endUTC, err := utils.ComputeShiftUTCTimes(newShiftDate, newStartTime, newEndTime, newTimezone)
+		if err != nil {
+			utils.BadRequest(c, "时区时间转换失败: "+err.Error())
+			return
+		}
+		updates["start_time_utc"] = startUTC
+		updates["end_time_utc"] = endUTC
+		updates["timezone"] = newTimezone
 	}
 	if req.ShiftType != "" {
 		updates["shift_type"] = req.ShiftType

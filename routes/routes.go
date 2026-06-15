@@ -68,5 +68,14 @@ func SetupRoutes(r *gin.Engine) {
 			prefs.GET("", controllers.GetMyPreferences)
 			prefs.PUT("", controllers.UpdatePreferences)
 		}
+
+		delegates := api.Group("/delegates")
+		delegates.Use(middleware.AuthMiddleware())
+		{
+			delegates.GET("", controllers.GetMyDelegates)
+			delegates.GET("/active", controllers.GetActiveDelegateInfo)
+			delegates.POST("", middleware.ManagerOrAdmin(), controllers.CreateDelegate)
+			delegates.POST("/:id/revoke", middleware.ManagerOrAdmin(), controllers.RevokeDelegate)
+		}
 	}
 }
